@@ -52,7 +52,7 @@ class DLinear(nn.Module):
                  seq_len=336, 
                  pred_len=96, 
                  individual=False, 
-                 kernel_size=25,
+                 kernel_size=49,
                  ):
         super(DLinear, self).__init__()
         self.seq_len = seq_len
