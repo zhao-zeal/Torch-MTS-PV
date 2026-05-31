@@ -18,11 +18,11 @@ Faithful target:
 
 Examples:
     python scripts/reproduce_part1_skippd.py \
-        --data_dir F:/3datas/SKIPPD \
+        --data_dir /home/zhaopp/workspace/solar-energy/dataset \
         --output_dir outputs/part1_skippd
 
     python scripts/reproduce_part1_skippd.py \
-        --csv_file F:/3datas/SKIPPD/skippd.csv \
+        --csv_file /home/zhaopp/workspace/solar-energy/dataset/skippd.csv \
         --output_dir outputs/part1_skippd
 """
 
