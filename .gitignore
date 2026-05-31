@@ -1,2 +1,7 @@
 logs/
 models/
+outputs/
+*.pt
+*.pth
+__pycache__/
+.ipynb_checkpoints/
