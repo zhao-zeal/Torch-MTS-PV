@@ -2,6 +2,11 @@
 """
 Reproduce the SKIPPD part of run_solarv4_part1.py.
 
+Important fix:
+- Do NOT select files by "15" in filename, because that can incorrectly pick task15.csv.
+- Prefer an exact skippd.csv file under --data_dir.
+- Use --csv_file when you want to specify the SKIPPD CSV explicitly.
+
 Faithful target:
 - single-variable PV power nowcasting
 - DLinear
@@ -11,9 +16,13 @@ Faithful target:
 - seed ensemble: 42 and 123
 - monthly capacity-normalized MAE/RMSE accuracy
 
-Example:
+Examples:
     python scripts/reproduce_part1_skippd.py \
         --data_dir F:/3datas/SKIPPD \
+        --output_dir outputs/part1_skippd
+
+    python scripts/reproduce_part1_skippd.py \
+        --csv_file F:/3datas/SKIPPD/skippd.csv \
         --output_dir outputs/part1_skippd
 """
 
@@ -71,14 +80,49 @@ def _read_csv_with_datetime_index(path: str) -> pd.DataFrame:
     return df.set_index(tcol).sort_index()
 
 
-def load_skippd(data_dir: str):
-    """Load SKIPPD power series following run_solarv4_part1.py."""
-    all_csv = glob.glob(os.path.join(data_dir, "**", "*.csv"), recursive=True)
+def resolve_skippd_csv(data_dir: str | None = None, csv_file: str | None = None) -> str:
+    """Resolve the correct SKIPPD CSV file.
+
+    The previous version used a filename-containing-'15' heuristic, which can
+    accidentally select task15.csv. For this reproduction we require the real
+    SKIPPD series file, preferably named skippd.csv.
+    """
+    if csv_file:
+        target = os.path.abspath(csv_file)
+        if not os.path.isfile(target):
+            raise FileNotFoundError(f"--csv_file does not exist: {target}")
+        return target
+
+    if not data_dir:
+        raise ValueError("Either --data_dir or --csv_file must be provided.")
+
+    all_csv = sorted(glob.glob(os.path.join(data_dir, "**", "*.csv"), recursive=True))
     if not all_csv:
         raise FileNotFoundError(f"No CSV files found under SKIPPD directory: {data_dir}")
 
-    f15 = [f for f in all_csv if "15" in os.path.basename(f).lower()]
-    target = f15[0] if f15 else all_csv[0]
+    # 1) Best case: exact skippd.csv, case-insensitive.
+    exact = [f for f in all_csv if os.path.basename(f).lower() == "skippd.csv"]
+    if exact:
+        return exact[0]
+
+    # 2) Accept close names such as SKIPPD_15min.csv, but still require SKIPPD in filename.
+    named = [f for f in all_csv if "skippd" in os.path.basename(f).lower()]
+    if named:
+        return named[0]
+
+    preview = "\n".join(f"  - {p}" for p in all_csv[:20])
+    raise FileNotFoundError(
+        "Cannot find skippd.csv under --data_dir. "
+        "This script intentionally refuses to fall back to task15.csv.\n"
+        "Please pass the real file explicitly, for example:\n"
+        "  --csv_file F:/3datas/SKIPPD/skippd.csv\n"
+        f"Found CSV files include:\n{preview}"
+    )
+
+
+def load_skippd(data_dir: str | None = None, csv_file: str | None = None):
+    """Load SKIPPD power series for the part1 reproduction."""
+    target = resolve_skippd_csv(data_dir=data_dir, csv_file=csv_file)
     print(f"[SKIPPD] using file: {target}")
 
     df = _read_csv_with_datetime_index(target)
@@ -99,7 +143,7 @@ def load_skippd(data_dir: str):
 
     power = df[power_col].astype(float).clip(lower=0)
 
-    # Keep the original logic: only resample very long/high-frequency files.
+    # Keep the part1 behavior: only resample very long/high-frequency files.
     if len(power) > 150000:
         power = power.resample("15min").mean()
 
@@ -134,8 +178,7 @@ class MovingAvg(nn.Module):
     def forward(self, x):
         front = x[:, 0:1].repeat(1, (self.kernel_size - 1) // 2)
         end = x[:, -1:].repeat(1, (self.kernel_size - 1) // 2)
-        x_pad = torch.cat([front, x, end], dim=1)
-        x_pad = x_pad.unsqueeze(1)
+        x_pad = torch.cat([front, x, end], dim=1).unsqueeze(1)
         avg = self.avg(x_pad)
         return avg.squeeze(1)
 
@@ -150,9 +193,7 @@ class DLinear(nn.Module):
     def forward(self, x):
         trend = self.moving_avg(x)
         seasonal = x - trend
-        trend_out = self.linear_trend(trend)
-        seasonal_out = self.linear_seasonal(seasonal)
-        return trend_out + seasonal_out
+        return self.linear_trend(trend) + self.linear_seasonal(seasonal)
 
 
 def train_one_seed(train_norm, val_norm, seed, args, device):
@@ -160,7 +201,6 @@ def train_one_seed(train_norm, val_norm, seed, args, device):
 
     train_dataset = PowerDataset(train_norm, args.seq_len, args.pred_len)
     val_dataset = PowerDataset(val_norm, args.seq_len, args.pred_len)
-
     if len(train_dataset) <= 0 or len(val_dataset) <= 0:
         raise ValueError(
             "Dataset is too short for the selected seq_len/pred_len. "
@@ -187,8 +227,7 @@ def train_one_seed(train_norm, val_norm, seed, args, device):
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
-            pred = model(x)
-            loss = criterion(pred, y)
+            loss = criterion(model(x), y)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -199,8 +238,7 @@ def train_one_seed(train_norm, val_norm, seed, args, device):
         with torch.no_grad():
             for x, y in val_loader:
                 x, y = x.to(device), y.to(device)
-                pred = model(x)
-                val_loss += criterion(pred, y).item()
+                val_loss += criterion(model(x), y).item()
         val_loss /= len(val_loader)
         scheduler.step(val_loss)
 
@@ -234,7 +272,6 @@ def train_ensemble(train_data, val_data, args, device):
 
     train_norm = (train_data - train_mean) / train_std
     val_norm = (val_data - train_mean) / train_std
-
     print(f"[Normalize] mean={train_mean:.6f}, std={train_std:.6f}")
 
     models = []
@@ -257,7 +294,6 @@ def evaluate_ensemble(models, test_data, test_ts, capacity, train_mean, train_st
             "Test dataset is too short for the selected seq_len/pred_len. "
             f"test_windows={len(test_dataset)}"
         )
-
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
     all_model_preds = []
@@ -266,23 +302,17 @@ def evaluate_ensemble(models, test_data, test_ts, capacity, train_mean, train_st
         preds = []
         with torch.no_grad():
             for x, _ in test_loader:
-                x = x.to(device)
-                pred = model(x)
-                preds.append(pred.cpu().numpy())
+                preds.append(model(x.to(device)).cpu().numpy())
         all_model_preds.append(np.concatenate(preds, axis=0))
 
     ensemble_pred = np.mean(all_model_preds, axis=0)
-
     trues = []
     for _, y in test_loader:
         trues.append(y.numpy())
     true_norm = np.concatenate(trues, axis=0)
 
-    pred_power = ensemble_pred[:, 0] * train_std + train_mean
-    true_power = true_norm[:, 0] * train_std + train_mean
-
-    pred_power = np.clip(pred_power, 0, None)
-    true_power = np.clip(true_power, 0, None)
+    pred_power = np.clip(ensemble_pred[:, 0] * train_std + train_mean, 0, None)
+    true_power = np.clip(true_norm[:, 0] * train_std + train_mean, 0, None)
 
     valid_ts = pd.DatetimeIndex(test_ts[args.seq_len: args.seq_len + len(pred_power)])
     if len(valid_ts) != len(pred_power):
@@ -321,7 +351,8 @@ def evaluate_ensemble(models, test_data, test_ts, capacity, train_mean, train_st
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Reproduce run_solarv4_part1.py on SKIPPD only.")
-    parser.add_argument("--data_dir", type=str, required=True, help="Path to SKIPPD directory.")
+    parser.add_argument("--data_dir", type=str, default=None, help="Path to SKIPPD directory. Used to search skippd.csv.")
+    parser.add_argument("--csv_file", type=str, default=None, help="Explicit path to skippd.csv. Highest priority.")
     parser.add_argument("--output_dir", type=str, default="outputs/part1_skippd")
     parser.add_argument("--capacity", type=float, default=30.0, help="SKIPPD capacity used for normalized accuracy.")
     parser.add_argument("--seq_len", type=int, default=672)
@@ -353,7 +384,7 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    power, timestamps, source_file, power_col = load_skippd(args.data_dir)
+    power, timestamps, source_file, power_col = load_skippd(args.data_dir, args.csv_file)
     train_idx = int(len(power) * args.train_ratio)
     val_idx = int(len(power) * (args.train_ratio + args.val_ratio))
 
